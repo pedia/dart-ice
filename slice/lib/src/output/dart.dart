@@ -1,0 +1,309 @@
+library slice.output.dart;
+
+import 'package:path/path.dart' as path;
+import '../../slice.dart';
+import 'output.dart';
+
+/// Helper for convert ice type to Dart type
+class DartType {
+  /// int, String, List<String>, ObjectPrx
+  final String type;
+
+  /// readable name, int => Int
+  /// used in InputStream.readInt
+  final String name;
+
+  /// If true this type provide in language, like int, String, List<String>
+  final bool system;
+
+  const DartType(this.type, this.name, this.system);
+
+  static const String uknownTypeName = '_';
+
+  /// ice type to Dart type table
+  static const types = {
+    'void': DartType('void', uknownTypeName, true),
+    'bool': DartType('bool', 'Bool', true),
+    'byte': DartType('int', 'Byte', true),
+    'short': DartType('int', 'Short', true),
+    'int': DartType('int', 'Int', true),
+    'long': DartType('int', 'Long', true),
+    'float': DartType('double', 'Float', true),
+    'double': DartType('double', 'Double', true),
+    'string': DartType('String', 'String', true),
+    'sequence<string>': DartType('List<String>', 'StringList', true),
+    'Identity': DartType('Identity', 'Identity', true),
+    'Object*': DartType('ObjectPrx', 'ObjectPrx', false),
+  };
+
+  /// Construct DartType from String
+  ///
+  factory DartType.of(String t) {
+    DartType? res = types[t];
+    if (res == null) {
+      if (t.startsWith('sequence<')) {
+        final arr = t.split(RegExp(r'[<>]'));
+        final innerType = DartType.of(arr[1]);
+        res = DartType(
+            'List<${innerType.type}>', uknownTypeName, innerType.system);
+      } else if (t.startsWith('dictionary<')) {
+        final arr = t.split(RegExp(r'[<, >]'))..removeWhere((x) => x.isEmpty);
+        final kt = DartType.of(arr[1]);
+        final vt = DartType.of(arr[2]);
+        res = DartType('Map<${kt.type}, ${vt.type}>', uknownTypeName,
+            kt.system && vt.system);
+      } else if (t.endsWith('*')) {
+        final name = t.split('*')[0] + 'Prx';
+        res = DartType(name, name, false);
+      } else {
+        res = DartType(t, t, false);
+      }
+    }
+    return res;
+  }
+}
+
+class DartMethod {
+  final Method m;
+  DartMethod(this.m);
+
+  DartType get returnType => DartType.of(m.returnType.type);
+
+  /// write:
+  ///  int a, int b
+  String get pdeclare {
+    final arr = m.prameterList
+        .map((p) => '${DartType.of(p.type).type} ${p.name}')
+        .toList();
+
+    arr.add('[Context? context]');
+    return arr.join(', ');
+  }
+
+  /// write
+  ///   out.writeInt(name);
+  String get pwrite => m.prameterList
+      .map((p) {
+        final dt = DartType.of(p.type);
+        if (dt.system) {
+          return '    out.write${dt.name}(${p.name});';
+        } else {
+          // call Type.write
+          return '    ${p.name}.write(out);';
+        }
+      })
+      .toList()
+      .join('\n');
+
+  static String preadOf(String s) {
+    final dt = DartType.of(s);
+
+    if (dt.system) {
+      return 'input.read${dt.name}()';
+    } else {
+      return '${dt.name}.read(input)';
+    }
+  }
+
+  /// return like:
+  ///   {
+  ///     input.readInt();
+  ///     return input.readInt();
+  ///   }
+  /// only one return value ptimized as: => input.readInt();
+  /// nothing ptimized as: {};
+  String get pread {
+    final arr = m.prameterList
+        .skipWhile((p) => !p.out)
+        .toList()
+        .map((p) => '${preadOf(p.type)}; // TODO: return tuple ${p.type}')
+        .toList();
+
+    if (m.returnType.type != 'void') {
+      if (arr.isEmpty) {
+        return '=> ${preadOf(m.returnType.type)}';
+      }
+
+      arr.add('return ${preadOf(m.returnType.type)};');
+    }
+
+    if (arr.isEmpty) return '{}';
+
+    arr.insert(0, '{');
+    arr.add('}');
+    return arr.join('\n');
+  }
+}
+
+class DartClass {
+  final Class c;
+  final Slice slice;
+  DartClass(this.c, this.slice);
+
+  String get ms => c.children.map((i) => 'this.${i.name}').toList().join(', ');
+
+  String get constructor => [
+        '  ${c.name}($ms)',
+        if (c.base != null) ' : super()',
+        ';',
+      ].join('');
+
+  String get base => c.base != null
+      ? 'extends ${c.base!}'
+      : {
+          'exception': 'implements Exception',
+          'class': 'extends Object',
+          'struct': '', // TODO: dart:core:Object
+        }[c.type]!;
+}
+
+/// Generator for Dart code
+class DartOutput extends Output {
+  DartOutput(
+    Slice slice, {
+    String? library,
+    bool system = false,
+    bool comment = true,
+  }) : super(slice, library: library, system: system, comment: comment);
+
+  @override
+  String filename() {
+    // Convert BuiltinSequences.ice to builtin_sequences.dart
+    // This apply dart style.
+    String base = path.basenameWithoutExtension(slice.filename);
+
+    final camelCaseMatcher = RegExp(r'[A-Z][a-z]*');
+    base = camelCaseMatcher
+        .allMatches(base)
+        .map((RegExpMatch m) => m.group(0)?.toLowerCase())
+        .join('_');
+
+    return path.setExtension(base, '.dart');
+  }
+
+  @override
+  String generate() {
+    final o = StringBuffer();
+    o.writeln('// generated by slice2dart ${slice.filename}\n');
+
+    if (!system && library == null) {
+      // o.writeln("import 'package:ice/ice.dart' as ice;\n");
+      o.writeln("import 'package:ice/ice.dart';\n");
+    }
+
+    if (library != null) {
+      o.writeln("part of $library;\n");
+    }
+
+    slice.root.forEach((id, m) => o.writeln(emitModule(m)));
+
+    return o.toString();
+  }
+
+  /// current module, TODO: Queue<Module>
+  late Module _module;
+
+  String emitModule(Module module) {
+    _module = module;
+    return super.emitModule(module);
+  }
+
+  String emitLocalInterface(Interface i) {
+    final o = StringBuffer();
+
+    o.writeln('abstract class ${i.name} {');
+
+    i.methodList.forEach((m) {
+      if (m.comment != null && comment) o.writeln('  ${m.comment}');
+
+      final dm = DartMethod(m);
+
+      o.writeln('  ${dm.returnType.type} ${m.name}(${dm.pdeclare});');
+    });
+
+    o.writeln('}');
+    return o.toString();
+  }
+
+  String emitInterface(Interface i) {
+    if (i.local) return emitLocalInterface(i);
+
+    final o = StringBuffer();
+
+    // Object
+    o.write('''
+abstract class ${i.name} extends Object {
+  static const _ids = ['${_module.id}::${i.name}', '::Ice::Object'];
+''');
+
+    i.methodList.forEach((m) => o.writeln(emitObjectMethod(m)));
+
+    o.write('''}
+
+class ${i.name}Prx extends ObjectPrx {
+  ${i.name}Prx(reference) : super(reference);
+
+  @override
+  String get ice_staticId => '${_module.id}::${i.name}';
+''');
+
+    o.write(i.methodList.map((m) => emitProxyMethod(m)).toList().join('\n\n'));
+
+    o.write('''\n\n  static ${i.name}Prx read(InputStream input) {
+    throw Exception();
+  }
+}''');
+
+    return o.toString();
+  }
+
+  String emitObjectMethod(Method m) {
+    return '  // TODO: method ${m.name}';
+  }
+
+  String emitProxyMethod(Method m) {
+    final dm = DartMethod(m);
+
+    return [
+      if (comment && m.comment != null) '${m.comment}',
+      '''  ${dm.returnType.name} ${m.name}(${dm.pdeclare}) =>
+    ice_invoke('${m.name}', ${m.mode}, context,
+      (out) {${dm.pwrite}},
+      (status, input) ${dm.pread},
+    );'''
+    ].join('\n');
+  }
+
+  String emitClass(Class c) => [
+        if (comment && c.comment != null) '${c.comment}',
+        'class ${c.name} ${DartClass(c, slice).base} {', // TODO:
+        ...c.children
+            .map((x) => [
+                  if (comment && x.comment != null) '  ${x.comment}',
+                  '  ${DartType.of(x.type).type} ${x.name};',
+                ].join('\n'))
+            .toList(),
+        if (c.children.isNotEmpty) DartClass(c, slice).constructor,
+        '}',
+        '\n',
+      ].join('\n');
+
+  String emitEnum(Enum e) => [
+        if (comment && e.comment != null) '${e.comment}',
+        'enum ${e.name} {',
+        ...e.children
+            .map((x) => [
+                  if (comment && e.comment != null) '  ${e.comment}',
+                  '  ${x.name},',
+                ].join('\n'))
+            .toList(),
+        '}',
+        '',
+      ].join('\n');
+
+  String emitTypo(Typo t) => [
+        if (comment && t.comment != null) '${t.comment}',
+        'typedef ${t.name} = ${DartType.of(t.type).type};',
+        '',
+      ].join('\n');
+}

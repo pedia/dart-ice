@@ -1,0 +1,5 @@
+
+analyzer:
+  errors:
+    slash_for_doc_comments: ignore
+    unnecessary_new: ignore
